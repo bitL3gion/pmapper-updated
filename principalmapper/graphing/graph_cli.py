@@ -29,6 +29,7 @@ from principalmapper.graphing.gathering import get_organizations_data
 from principalmapper.graphing.edge_identification import checker_map
 from principalmapper.querying import query_orgs
 from principalmapper.util import botocore_tools
+from principalmapper.util.concurrency import DEFAULT_MAX_WORKERS
 from principalmapper.util.storage import get_storage_root
 
 
@@ -94,6 +95,16 @@ def provide_arguments(parser: ArgumentParser):
         nargs='*',
         help='A deny-list of services to search for Edge objects, cannot be combined with --include-services',
         metavar='SERVICE'
+    )
+
+    create_parser.add_argument(
+        '--max-threads',
+        type=int,
+        default=DEFAULT_MAX_WORKERS,
+        help='The maximum number of concurrent AWS API calls/edge-checkers to run while gathering data '
+             '(default: {}). Raise this to speed up large accounts further, at the risk of hitting AWS API '
+             'throttling; set to 1 for the old fully-sequential behavior.'.format(DEFAULT_MAX_WORKERS),
+        metavar='N'
     )
 
     # args for commands fitting the pattern "pmapper graph display ..."
@@ -177,7 +188,8 @@ def process_arguments(parsed_args: Namespace):
             client_args_map = None
 
         graph = graph_actions.create_new_graph(session, service_list, parsed_args.include_regions,
-                                               parsed_args.exclude_regions, scps, client_args_map)
+                                               parsed_args.exclude_regions, scps, client_args_map,
+                                               parsed_args.max_threads)
         graph_actions.print_graph_data(graph)
         graph.store_graph_as_json(os.path.join(get_storage_root(), graph.metadata['account_id']))
 

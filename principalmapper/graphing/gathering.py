@@ -28,6 +28,7 @@ from principalmapper.graphing import edge_identification
 from principalmapper.querying import query_interface
 from principalmapper.util import arns
 from principalmapper.util.botocore_tools import get_regions_to_search
+from principalmapper.util.concurrency import DEFAULT_MAX_WORKERS, thread_map
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 def create_graph(session: botocore.session.Session, service_list: list, region_allow_list: Optional[List[str]] = None,
                  region_deny_list: Optional[List[str]] = None, scps: Optional[List[List[dict]]] = None,
-                 client_args_map: Optional[dict] = None) -> Graph:
+                 client_args_map: Optional[dict] = None, max_workers: int = DEFAULT_MAX_WORKERS) -> Graph:
     """Constructs a Graph object.
 
     Information about the graph as it's built will be written to the IO parameter `output`.
@@ -54,6 +55,11 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
     ```
 
     Later on, when calling create_client('iam', ...) the map will be added via kwargs
+
+    `max_workers` bounds how many API calls PMapper will make concurrently while gathering data (per-principal
+    detail lookups, per-resource policy lookups, and the per-service edge checkers). Raise it to speed up
+    large accounts further, at the risk of hitting AWS API throttling; lower it (down to 1 for fully
+    sequential/legacy behavior) if you're seeing throttling errors.
     """
 
     if client_args_map is None:
@@ -72,7 +78,7 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
     iamargs = client_args_map.get('iam', {})
     iamclient = session.create_client('iam', **iamargs)
 
-    results = get_nodes_groups_and_policies(iamclient)
+    results = get_nodes_groups_and_policies(iamclient, max_workers)
     nodes_result = results['nodes']
     groups_result = results['groups']
     policies_result = results['policies']
@@ -88,23 +94,36 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
         region_allow_list,
         region_deny_list,
         scps,
-        client_args_map
+        client_args_map,
+        max_workers
     )
 
-    # Pull S3, SNS, SQS, KMS, and Secrets Manager resource policies
-    try:
-        policies_result.extend(get_s3_bucket_policies(session, client_args_map))
-        policies_result.extend(get_sns_topic_policies(session, region_allow_list, region_deny_list, client_args_map))
-        policies_result.extend(get_sqs_queue_policies(session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
-        policies_result.extend(get_kms_key_policies(session, region_allow_list, region_deny_list, client_args_map))
-        policies_result.extend(get_secrets_manager_policies(session, region_allow_list, region_deny_list, client_args_map))
-    except:
-        pass
+    # Pull S3, SNS, SQS, KMS, and Secrets Manager resource policies. These are independent of each other, so
+    # run them concurrently, and let each fail on its own (e.g. due to missing permissions for that one
+    # service) without preventing the others from completing.
+    resource_policy_gatherers = [
+        ('S3', lambda: get_s3_bucket_policies(session, client_args_map, max_workers)),
+        ('SNS', lambda: get_sns_topic_policies(session, region_allow_list, region_deny_list, client_args_map, max_workers)),
+        ('SQS', lambda: get_sqs_queue_policies(session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map, max_workers)),
+        ('KMS', lambda: get_kms_key_policies(session, region_allow_list, region_deny_list, client_args_map, max_workers)),
+        ('Secrets Manager', lambda: get_secrets_manager_policies(session, region_allow_list, region_deny_list, client_args_map, max_workers)),
+    ]
+
+    def _gather_resource_policies(entry: Tuple[str, callable]) -> List[Policy]:
+        service_name, gatherer = entry
+        try:
+            return gatherer()
+        except Exception as ex:
+            logger.info('Unable to gather resource policies for {}, skipping. Exception: {}'.format(service_name, ex))
+            return []
+
+    for policy_list in thread_map(_gather_resource_policies, resource_policy_gatherers, max_workers=len(resource_policy_gatherers)):
+        policies_result.extend(policy_list)
 
     return Graph(nodes_result, edges_result, policies_result, groups_result, metadata)
 
 
-def get_nodes_groups_and_policies(iamclient) -> dict:
+def get_nodes_groups_and_policies(iamclient, max_workers: int = DEFAULT_MAX_WORKERS) -> dict:
     """Using an IAM.Client object, return a dictionary containing nodes, groups, and policies to be
     added to a Graph object. Admin status for the nodes are not updated.
 
@@ -238,26 +257,35 @@ def get_nodes_groups_and_policies(iamclient) -> dict:
             )
         )
 
-    logger.info("Obtaining Access Keys data for IAM users")
-    for node in result['nodes']:
-        if arns.get_resource(node.arn).startswith('user/'):
-            # Grab access-key count and update node
-            user_name = arns.get_resource(node.arn)[5:]
-            if '/' in user_name:
-                user_name = user_name.split('/')[-1]
-            access_keys_data = iamclient.list_access_keys(UserName=user_name)
-            node.access_keys = len(access_keys_data['AccessKeyMetadata'])
-            # logger.debug('Access Key Count for {}: {}'.format(user_name, len(access_keys_data['AccessKeyMetadata'])))
-            # Grab password data and update node
-            try:
-                login_profile_data = iamclient.get_login_profile(UserName=user_name)
-                if 'LoginProfile' in login_profile_data:
-                    node.active_password = True
-            except Exception as ex:
-                if 'NoSuchEntity' in str(ex):
-                    node.active_password = False  # expecting this
-                else:
-                    raise ex
+    logger.info("Obtaining Access Keys and MFA data for IAM users")
+
+    def _fill_user_details(node: Node) -> None:
+        """Fetches access-key count, password status, and physical MFA device status for a single IAM user
+        Node and updates it in-place. Split out so it can be run concurrently across users: these are three
+        independent API calls per user with no shared state other than the Node being updated."""
+        user_name = arns.get_resource(node.arn)[5:]
+        if '/' in user_name:
+            user_name = user_name.split('/')[-1]
+
+        access_keys_data = iamclient.list_access_keys(UserName=user_name)
+        node.access_keys = len(access_keys_data['AccessKeyMetadata'])
+
+        try:
+            login_profile_data = iamclient.get_login_profile(UserName=user_name)
+            if 'LoginProfile' in login_profile_data:
+                node.active_password = True
+        except Exception as ex:
+            if 'NoSuchEntity' in str(ex):
+                node.active_password = False  # expecting this
+            else:
+                raise ex
+
+        mfa_devices_response = iamclient.list_mfa_devices(UserName=user_name)
+        if len(mfa_devices_response['MFADevices']) > 0:
+            node.has_mfa = True
+
+    user_nodes = [node for node in result['nodes'] if arns.get_resource(node.arn).startswith('user/')]
+    thread_map(_fill_user_details, user_nodes, max_workers=max_workers)
 
     logger.info('Gathering MFA virtual device information')
     mfa_paginator = iamclient.get_paginator('list_virtual_mfa_devices')
@@ -270,58 +298,41 @@ def get_nodes_groups_and_policies(iamclient) -> dict:
                     node.has_mfa = True
                     break
 
-    logger.info('Gathering MFA physical device information')
-    for node in result['nodes']:
-        node_resource_name = arns.get_resource(node.arn)
-        if node_resource_name.startswith('user/'):
-            user_name = node_resource_name.split('/')[-1]
-            mfa_devices_response = iamclient.list_mfa_devices(UserName=user_name)
-            if len(mfa_devices_response['MFADevices']) > 0:
-                node.has_mfa = True
-
     return result
 
 
-def get_s3_bucket_policies(session: botocore.session.Session, client_args_map: Optional[dict] = None) -> List[Policy]:
+def get_s3_bucket_policies(session: botocore.session.Session, client_args_map: Optional[dict] = None,
+                           max_workers: int = DEFAULT_MAX_WORKERS) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the bucket policies of each
     S3 bucket in this account.
     """
-    result = []
     s3args = client_args_map.get('s3', {})
     s3client = session.create_client('s3', **s3args)
     buckets = [x['Name'] for x in s3client.list_buckets()['Buckets']]
-    for bucket in buckets:
+
+    def _fetch_bucket_policy(bucket: str) -> Optional[Policy]:
         bucket_arn = 'arn:aws:s3:::{}'.format(bucket)  # TODO: allow different partition
         try:
             bucket_policy = json.loads(s3client.get_bucket_policy(Bucket=bucket)['Policy'])
-            result.append(Policy(
-                bucket_arn,
-                bucket,
-                bucket_policy
-            ))
             logger.info('Caching policy for {}'.format(bucket_arn))
+            return Policy(bucket_arn, bucket, bucket_policy)
         except botocore.exceptions.ClientError as ex:
             if 'NoSuchBucketPolicy' in str(ex):
                 logger.info('Bucket {} does not have a bucket policy, adding a "stub" policy instead.'.format(
                     bucket
                 ))
-                result.append(Policy(
-                    bucket_arn,
-                    bucket,
-                    {
-                        "Statement": [],
-                        "Version": "2012-10-17"
-                    }
-                ))
+                return Policy(bucket_arn, bucket, {"Statement": [], "Version": "2012-10-17"})
             else:
                 logger.info('Unable to retrieve bucket policy for {}. You should add this manually. Continuing.'.format(bucket))
-            logger.debug('Exception was: {}'.format(ex))
+                logger.debug('Exception was: {}'.format(ex))
+                return None
 
-    return result
+    return [policy for policy in thread_map(_fetch_bucket_policy, buckets, max_workers=max_workers) if policy is not None]
 
 
 def get_kms_key_policies(session: botocore.session.Session, region_allow_list: Optional[List[str]] = None,
-                         region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None) -> List[Policy]:
+                         region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None,
+                         max_workers: int = DEFAULT_MAX_WORKERS) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the key policies of each
     KMS key in this account.
 
@@ -343,14 +354,16 @@ def get_kms_key_policies(session: botocore.session.Session, region_allow_list: O
                 cmks.extend([x['KeyArn'] for x in page['Keys']])
 
             # Grab the key policies
-            for cmk in cmks:
+            def _fetch_key_policy(cmk: str) -> Policy:
                 policy_str = kmsclient.get_key_policy(KeyId=cmk, PolicyName='default')['Policy']
-                result.append(Policy(
+                logger.info('Caching policy for {}'.format(cmk))
+                return Policy(
                     cmk,
                     cmk.split('/')[-1],  # CMK ARN Format: arn:<partition>:kms:<region>:<account>:key/<Key ID>
                     json.loads(policy_str)
-                ))
-                logger.info('Caching policy for {}'.format(cmk))
+                )
+
+            result.extend(thread_map(_fetch_key_policy, cmks, max_workers=max_workers))
         except botocore.exceptions.ClientError as ex:
             logger.info('Unable to search KMS in region {} for key policies. The region may be disabled, or the current principal may not be authorized to access the service. Continuing.'.format(kms_region))
             logger.debug('Exception was: {}'.format(ex))
@@ -360,7 +373,8 @@ def get_kms_key_policies(session: botocore.session.Session, region_allow_list: O
 
 
 def get_sns_topic_policies(session: botocore.session.Session, region_allow_list: Optional[List[str]] = None,
-                           region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None) -> List[Policy]:
+                           region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None,
+                           max_workers: int = DEFAULT_MAX_WORKERS) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the topic policies of each
     SNS topic in this account.
 
@@ -382,14 +396,16 @@ def get_sns_topic_policies(session: botocore.session.Session, region_allow_list:
                 topics.extend([x['TopicArn'] for x in page['Topics']])
 
             # Grab the topic policies
-            for topic in topics:
+            def _fetch_topic_policy(topic: str) -> Policy:
                 policy_str = snsclient.get_topic_attributes(TopicArn=topic)['Attributes']['Policy']
-                result.append(Policy(
+                logger.info('Caching policy for {}'.format(topic))
+                return Policy(
                     topic,
                     topic.split(':')[-1],  # SNS Topic ARN Format: arn:<partition>:sns:<region>:<account>:<Topic Name>
                     json.loads(policy_str)
-                ))
-                logger.info('Caching policy for {}'.format(topic))
+                )
+
+            result.extend(thread_map(_fetch_topic_policy, topics, max_workers=max_workers))
         except botocore.exceptions.ClientError as ex:
             logger.info('Unable to search SNS in region {} for topic policies. The region may be disabled, or the current principal may not be authorized to access the service. Continuing.'.format(sns_region))
             logger.debug('Exception was: {}'.format(ex))
@@ -400,7 +416,8 @@ def get_sns_topic_policies(session: botocore.session.Session, region_allow_list:
 
 def get_sqs_queue_policies(session: botocore.session.Session, account_id: str,
                            region_allow_list: Optional[List[str]] = None, region_deny_list: Optional[List[str]] = None,
-                           client_args_map: Optional[dict] = None) -> List[Policy]:
+                           client_args_map: Optional[dict] = None,
+                           max_workers: int = DEFAULT_MAX_WORKERS) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the queue policies of each
     SQS queue in this account.
 
@@ -424,27 +441,19 @@ def get_sqs_queue_policies(session: botocore.session.Session, account_id: str,
                 continue
 
             # Grab the queue policies
-            for queue_url in queue_urls:
+            def _fetch_queue_policy(queue_url: str) -> Policy:
                 queue_name = queue_url.split('/')[-1]
+                queue_arn = 'arn:aws:sqs:{}:{}:{}'.format(sqs_region, account_id, queue_name)
                 sqs_policy_response = sqsclient.get_queue_attributes(QueueUrl=queue_url, AttributeNames=['Policy'])
                 if 'Policy' in sqs_policy_response:
                     sqs_policy_doc = json.loads(sqs_policy_response['Policy'])
-                    result.append(Policy(
-                        'arn:aws:sqs:{}:{}:{}'.format(sqs_region, account_id, queue_name),
-                        queue_name,
-                        json.loads(sqs_policy_doc)
-                    ))
-                    logger.info('Caching policy for {}'.format('arn:aws:sqs:{}:{}:{}'.format(sqs_region, account_id, queue_name)))
+                    logger.info('Caching policy for {}'.format(queue_arn))
+                    return Policy(queue_arn, queue_name, sqs_policy_doc)
                 else:
-                    result.append(Policy(
-                        'arn:aws:sqs:{}:{}:{}'.format(sqs_region, account_id, queue_name),
-                        queue_name,
-                        {
-                            "Statement": [],
-                            "Version": "2012-10-17"
-                        }
-                    ))
                     logger.info('Queue {} does not have a queue policy, adding a "stub" policy instead.'.format(queue_name))
+                    return Policy(queue_arn, queue_name, {"Statement": [], "Version": "2012-10-17"})
+
+            result.extend(thread_map(_fetch_queue_policy, queue_urls, max_workers=max_workers))
         except botocore.exceptions.ClientError as ex:
             logger.info('Unable to search SQS in region {} for queues. The region may be disabled, or the current principal may not be authorized to access the service. Continuing.'.format(sqs_region))
             logger.debug('Exception was: {}'.format(ex))
@@ -453,7 +462,8 @@ def get_sqs_queue_policies(session: botocore.session.Session, account_id: str,
 
 
 def get_secrets_manager_policies(session: botocore.session.Session, region_allow_list: Optional[List[str]] = None,
-                                 region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None) -> List[Policy]:
+                                 region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None,
+                                 max_workers: int = DEFAULT_MAX_WORKERS) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the resource policies
     of the secrets in AWS Secrets Manager.
 
@@ -479,29 +489,19 @@ def get_secrets_manager_policies(session: botocore.session.Session, region_allow
                         secret_arns.append(entry['ARN'])
 
             # Grab resource policies for each secret
-            for secret_arn in secret_arns:
+            def _fetch_secret_policy(secret_arn: str) -> Policy:
                 sm_response = smclient.get_resource_policy(SecretId=secret_arn)
 
                 # verify that it is in the response and not None/empty
                 if 'ResourcePolicy' in sm_response and sm_response['ResourcePolicy']:
                     sm_policy_doc = json.loads(sm_response['ResourcePolicy'])
-                    result.append(Policy(
-                        secret_arn,
-                        sm_response['Name'],
-                        sm_policy_doc
-                    ))
                     logger.info('Storing the resource policy for secret {}'.format(secret_arn))
+                    return Policy(secret_arn, sm_response['Name'], sm_policy_doc)
                 else:
-                    result.append(Policy(
-                        secret_arn,
-                        sm_response['Name'],
-                        {
-                            "Statement": [],
-                            "Version": "2012-10-17"
-                        }
-                    ))
                     logger.info('Secret {} does not have a resource policy, inserting a "stub" policy instead'.format(secret_arn))
+                    return Policy(secret_arn, sm_response['Name'], {"Statement": [], "Version": "2012-10-17"})
 
+            result.extend(thread_map(_fetch_secret_policy, secret_arns, max_workers=max_workers))
         except botocore.exceptions.ClientError as ex:
             logger.info('Unable to search Secrets Manager in region {} for secrets. The region may be disabled, or '
                         'the current principal may not be authorized to access the service. '

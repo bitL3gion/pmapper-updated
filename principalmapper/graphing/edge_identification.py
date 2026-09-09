@@ -30,6 +30,7 @@ from principalmapper.graphing.lambda_edges import LambdaEdgeChecker
 from principalmapper.graphing.sagemaker_edges import SageMakerEdgeChecker
 from principalmapper.graphing.ssm_edges import SSMEdgeChecker
 from principalmapper.graphing.sts_edges import STSEdgeChecker
+from principalmapper.util.concurrency import DEFAULT_MAX_WORKERS, thread_map
 
 
 logger = logging.getLogger(__name__)
@@ -51,14 +52,24 @@ checker_map = {
 
 def obtain_edges(session: Optional[botocore.session.Session], checker_list: List[str], nodes: List[Node],
                  region_allow_list: Optional[List[str]] = None, region_deny_list: Optional[List[str]] = None,
-                 scps: Optional[List[List[dict]]] = None, client_args_map: Optional[dict] = None) -> List[Edge]:
+                 scps: Optional[List[List[dict]]] = None, client_args_map: Optional[dict] = None,
+                 max_workers: int = DEFAULT_MAX_WORKERS) -> List[Edge]:
     """Given a list of nodes and a botocore Session, return a list of edges between those nodes. Only checks
-    against services passed in the checker_list param. """
-    result = []
+    against services passed in the checker_list param.
+
+    The per-service checkers are independent of each other (each only reads `nodes`, never mutates it) and mix
+    AWS API calls with local computation, so running them concurrently lets one checker's network waits overlap
+    with another's work instead of paying for everything strictly back-to-back.
+    """
     logger.info('Initiating edge checks.')
     logger.debug('Services being checked for edges: {}'.format(checker_list))
-    for check in checker_list:
-        if check in checker_map:
-            checker_obj = checker_map[check](session)
-            result.extend(checker_obj.return_edges(nodes, region_allow_list, region_deny_list, scps, client_args_map))
+
+    def _run_checker(check: str) -> List[Edge]:
+        checker_obj = checker_map[check](session)
+        return checker_obj.return_edges(nodes, region_allow_list, region_deny_list, scps, client_args_map)
+
+    applicable_checks = [check for check in checker_list if check in checker_map]
+    result = []
+    for edge_list in thread_map(_run_checker, applicable_checks, max_workers=max_workers):
+        result.extend(edge_list)
     return result

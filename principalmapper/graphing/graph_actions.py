@@ -23,6 +23,7 @@ import sys
 import botocore.session
 from principalmapper.common import Graph
 from principalmapper.graphing import gathering
+from principalmapper.util.concurrency import DEFAULT_MAX_WORKERS
 from principalmapper.util.storage import get_default_graph_path
 from typing import List, Optional
 
@@ -32,11 +33,13 @@ logger = logging.getLogger(__name__)
 
 def create_new_graph(session: botocore.session.Session, service_list: List[str],
                      region_allow_list: Optional[List[str]] = None, region_deny_list: Optional[List[str]] = None,
-                     scps: Optional[List[List[dict]]] = None, client_args_map: Optional[dict] = None) -> Graph:
+                     scps: Optional[List[List[dict]]] = None, client_args_map: Optional[dict] = None,
+                     max_workers: int = DEFAULT_MAX_WORKERS) -> Graph:
     """Wraps around principalmapper.graphing.gathering.create_graph(...) This fulfills `pmapper graph create`.
     """
 
-    return gathering.create_graph(session, service_list, region_allow_list, region_deny_list, scps, client_args_map)
+    return gathering.create_graph(session, service_list, region_allow_list, region_deny_list, scps, client_args_map,
+                                  max_workers)
 
 
 def print_graph_data(graph: Graph) -> None:
