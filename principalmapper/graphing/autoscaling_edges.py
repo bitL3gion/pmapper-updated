@@ -165,19 +165,40 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                 continue  # can't create an auto-scaling group -> move along
 
             if node_destination in role_lc_map:
+                lc_arn = role_lc_map[node_destination][0]
                 if service_role_available:
                     reason = 'can use the EC2 Auto Scaling service role and an existing Launch Configuration to access'
                 else:
                     reason = 'can create the EC2 Auto Scaling service role and an existing Launch Configuration to access'
 
+                permissions = ['autoscaling:CreateAutoScalingGroup']
+                if not service_role_available:
+                    permissions.insert(0, 'iam:CreateServiceLinkedRole')
+
                 if csr_mfa or casg_mfa:
                     reason = '(MFA Required) ' + reason
+
+                commands = []
+                if not service_role_available:
+                    commands.append(
+                        'aws iam create-service-linked-role --aws-service-name autoscaling.amazonaws.com'
+                    )
+                commands.append(
+                    'aws autoscaling create-auto-scaling-group --auto-scaling-group-name pmapper-poc '
+                    '--launch-configuration-name {} --min-size 1 --max-size 1 '
+                    '--availability-zones <AVAILABILITY_ZONE>'.format(arns.get_name(lc_arn))
+                )
+                commands.append(
+                    'On the new instance: curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{}'.format(arns.get_name(node_destination.arn))
+                )
 
                 result.append(Edge(
                     node_source,
                     node_destination,
                     reason,
-                    'EC2 Auto Scaling'
+                    'EC2 Auto Scaling (CreateAutoScalingGroup)',
+                    permissions,
+                    commands
                 ))
 
             create_launch_config_auth, clc_mfa = query_interface.local_check_authorization_handling_mfa(
@@ -209,11 +230,37 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                 if clc_mfa or pr_mfa:
                     reason = '(MFA Required) ' + reason
 
+                permissions = ['iam:PassRole', 'autoscaling:CreateLaunchConfiguration',
+                              'autoscaling:CreateAutoScalingGroup']
+                if not service_role_available:
+                    permissions.insert(0, 'iam:CreateServiceLinkedRole')
+
+                commands = []
+                if not service_role_available:
+                    commands.append(
+                        'aws iam create-service-linked-role --aws-service-name autoscaling.amazonaws.com'
+                    )
+                iprofile_name = arns.get_name(node_destination.instance_profile[0]) if node_destination.instance_profile else '<INSTANCE_PROFILE_NAME_FOR_ROLE>'
+                commands.append(
+                    'aws autoscaling create-launch-configuration --launch-configuration-name pmapper-poc '
+                    '--image-id <AMI_ID> --instance-type t2.micro --iam-instance-profile {}'.format(iprofile_name)
+                )
+                commands.append(
+                    'aws autoscaling create-auto-scaling-group --auto-scaling-group-name pmapper-poc '
+                    '--launch-configuration-name pmapper-poc --min-size 1 --max-size 1 '
+                    '--availability-zones <AVAILABILITY_ZONE>'
+                )
+                commands.append(
+                    'On the new instance: curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{}'.format(arns.get_name(node_destination.arn))
+                )
+
                 result.append(Edge(
                     node_source,
                     node_destination,
                     reason,
-                    'EC2 Auto Scaling'
+                    'EC2 Auto Scaling (CreateLaunchConfiguration, PassRole)',
+                    permissions,
+                    commands
                 ))
 
     return result

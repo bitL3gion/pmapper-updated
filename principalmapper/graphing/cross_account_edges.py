@@ -99,12 +99,20 @@ def get_edges_between_graphs(graph_a: Graph, graph_b: Graph, scps_a: Optional[Li
             if node_b.searchable_name().startswith('role/'):
                 if _check_assume_role(graph_a, node_a, graph_b, node_b, scps_a):
                     logger.info('Found edge: {}'.format(_describe_edge(node_a, node_b)))
-                    result.append(Edge(node_a, node_b, 'can call sts:AssumeRole to access', 'STS'))
+                    result.append(Edge(
+                        node_a, node_b, 'can call sts:AssumeRole to access', 'STS (AssumeRole, cross-account)',
+                        ['sts:AssumeRole'],
+                        ['aws sts assume-role --role-arn {} --role-session-name pmapper-poc'.format(node_b.arn)]
+                    ))
 
             # check b -> a
             if node_a.searchable_name().startswith('role/'):
                 if _check_assume_role(graph_b, node_b, graph_a, node_a, scps_b):
                     logger.info('Found edge: {}'.format(_describe_edge(node_b, node_a)))
-                    result.append(Edge(node_b, node_a, 'can call sts:AssumeRole to access', 'STS'))
+                    result.append(Edge(
+                        node_b, node_a, 'can call sts:AssumeRole to access', 'STS (AssumeRole, cross-account)',
+                        ['sts:AssumeRole'],
+                        ['aws sts assume-role --role-arn {} --role-session-name pmapper-poc'.format(node_a.arn)]
+                    ))
 
     return result

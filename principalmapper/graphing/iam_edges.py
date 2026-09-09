@@ -24,6 +24,7 @@ from typing import List, Optional
 from principalmapper.common import Edge, Node
 from principalmapper.graphing.edge_checker import EdgeChecker
 from principalmapper.querying import query_interface
+from principalmapper.util import arns
 
 
 logger = logging.getLogger(__name__)
@@ -92,12 +93,26 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
 
                 if create_auth_res:
                     reason = 'can create access keys to authenticate as'
+                    permissions = ['iam:CreateAccessKey']
+                    if node_destination.access_keys == 2:
+                        permissions.append('iam:DeleteAccessKey')
                     if access_keys_mfa:
                         reason = '(MFA required) ' + reason
 
+                    dest_user_name = arns.get_name(node_destination.arn)
+                    commands = []
+                    if node_destination.access_keys == 2:
+                        commands.append(
+                            'aws iam list-access-keys --user-name {}  # find an existing key to delete'.format(dest_user_name)
+                        )
+                        commands.append(
+                            'aws iam delete-access-key --user-name {} --access-key-id <EXISTING_ACCESS_KEY_ID>'.format(dest_user_name)
+                        )
+                    commands.append('aws iam create-access-key --user-name {}'.format(dest_user_name))
+
                     result.append(
                         Edge(
-                            node_source, node_destination, reason, 'IAM'
+                            node_source, node_destination, reason, 'IAM (CreateAccessKey)', permissions, commands
                         )
                     )
 
@@ -120,9 +135,18 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     )
                 if pass_auth_res:
                     reason = 'can set the password to authenticate as'
+                    action = 'iam:UpdateLoginProfile' if node_destination.active_password else 'iam:CreateLoginProfile'
+                    dest_user_name = arns.get_name(node_destination.arn)
                     if mfa_res:
                         reason = '(MFA required) ' + reason
-                    result.append(Edge(node_source, node_destination, reason, 'IAM'))
+                    result.append(Edge(
+                        node_source, node_destination, reason, 'IAM ({})'.format(action.split(':')[1]),
+                        [action],
+                        ['aws iam {} --user-name {} --password <NewPassword123!> --no-password-reset-required'.format(
+                            'update-login-profile' if node_destination.active_password else 'create-login-profile',
+                            dest_user_name
+                        )]
+                    ))
 
             if ':role/' in node_destination.arn:
                 # Change the role's trust doc
@@ -137,6 +161,17 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     reason = 'can update the trust document to access'
                     if mfa_res:
                         reason = '(MFA required) ' + reason
-                    result.append(Edge(node_source, node_destination, reason, 'IAM'))
+                    dest_role_name = arns.get_name(node_destination.arn)
+                    result.append(Edge(
+                        node_source, node_destination, reason, 'IAM (UpdateAssumeRolePolicy)',
+                        ['iam:UpdateAssumeRolePolicy'],
+                        [
+                            'aws iam update-assume-role-policy --role-name {} --policy-document '
+                            'file://trust-policy.json  # trust-policy.json grants {} sts:AssumeRole'.format(
+                                dest_role_name, node_source.searchable_name()
+                            ),
+                            'aws sts assume-role --role-arn {} --role-session-name pmapper-poc'.format(node_destination.arn)
+                        ]
+                    ))
 
     return result

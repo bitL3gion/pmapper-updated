@@ -214,6 +214,7 @@ class Graph(object):
                 if source is not None and destination is not None:
                     break
             edges.append(Edge(source=source, destination=destination, reason=edge['reason'],
-                              short_reason=edge['short_reason']))
+                              short_reason=edge['short_reason'], permissions=edge.get('permissions'),
+                              commands=edge.get('commands')))
 
         return Graph(nodes=nodes, edges=edges, policies=policies, groups=groups, metadata=metadata)

@@ -97,7 +97,16 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                 reason = 'can call ssm:SendCommand to access an EC2 instance with access to'
                 if mfa_res_1:
                     reason = '(Requires MFA) ' + reason
-                result.append(Edge(node_source, node_destination, reason, 'SSM'))
+                result.append(Edge(
+                    node_source, node_destination, reason, 'SSM (SendCommand)',
+                    ['ssm:SendCommand'],
+                    [
+                        'aws ssm describe-instance-information  # find an instance using the role {}'.format(arns.get_name(node_destination.arn)),
+                        'aws ssm send-command --instance-ids <INSTANCE_ID> --document-name "AWS-RunShellScript" '
+                        '--parameters commands="curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{}"'.format(arns.get_name(node_destination.arn)),
+                        'aws ssm get-command-invocation --command-id <COMMAND_ID> --instance-id <INSTANCE_ID>'
+                    ]
+                ))
 
             sesh_auth_res, mfa_res_2 = query_interface.local_check_authorization_handling_mfa(
                 node_source,
@@ -110,6 +119,14 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                 reason = 'can call ssm:StartSession to access an EC2 instance with access to'
                 if mfa_res_2:
                     reason = '(Requires MFA) ' + reason
-                result.append(Edge(node_source, node_destination, reason, 'SSM'))
+                result.append(Edge(
+                    node_source, node_destination, reason, 'SSM (StartSession)',
+                    ['ssm:StartSession'],
+                    [
+                        'aws ssm describe-instance-information  # find an instance using the role {}'.format(arns.get_name(node_destination.arn)),
+                        'aws ssm start-session --target <INSTANCE_ID>',
+                        '# then, on the instance: curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{}'.format(arns.get_name(node_destination.arn))
+                    ]
+                ))
 
     return result

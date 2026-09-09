@@ -22,6 +22,15 @@ from principalmapper.querying.presets.privesc import can_privesc
 from principalmapper.querying.presets.serviceaccess import compose_service_access_map
 
 
+def _edge_tooltip(edge: Edge) -> str:
+    """Builds a Graphviz-safe tooltip string with the full reason, IAM permissions, and example command(s)
+    for an edge, so a diagram viewer can hover over an edge to see exactly what was found and how it could be
+    used, without cluttering the visible edge label."""
+    # Graphviz interprets a literal backslash-n as a line-break within a quoted attribute value; an actual
+    # newline character can trip up some renderers/parsers, so escape it here.
+    return edge.detailed_description().replace('\n', '\\n')
+
+
 def write_standard_graphviz(graph: Graph, filepath: str, file_format: str, with_services: Optional[bool] = False) -> None:
     """The function to generate the standard visualization with a Graphviz-generated file: this is all the nodes
     with the admins/privesc highlights in blue/red respectively."""
@@ -51,7 +60,12 @@ def write_standard_graphviz(graph: Graph, filepath: str, file_format: str, with_
 
     for edge in graph.edges:
         if not edge.source.is_admin:
-            pydg.add_edge(pydot.Edge(pyd_nd[edge.source], pyd_nd[edge.destination]))
+            pydg.add_edge(pydot.Edge(
+                pyd_nd[edge.source],
+                pyd_nd[edge.destination],
+                label=edge.short_reason,
+                tooltip=_edge_tooltip(edge)
+            ))
 
     # draw service nodes and edges
     if with_services:
@@ -113,7 +127,8 @@ def write_privesc_graphviz(graph: Graph, filepath: str, file_format: str) -> Non
                 s.add_node(pydot_node)
 
                 edge_to_add = pydot.Edge(node.searchable_name(), edge_list[0].destination.searchable_name(),
-                                         xlabel=edge_list[0].short_reason)
+                                         xlabel=edge_list[0].short_reason,
+                                         tooltip=_edge_tooltip(edge_list[0]))
                 pydg.add_edge(edge_to_add)
 
         pydg.add_subgraph(s)
@@ -146,7 +161,12 @@ def generate_graphviz(graph: Graph, nodes: List[Node], edges: List[Edge], filepa
 
     for edge in edges:
         if not edge.source.is_admin:
-            pydg.add_edge(pydot.Edge(pyd_nd[edge.source], pyd_nd[edge.destination], label=edge.short_reason))
+            pydg.add_edge(pydot.Edge(
+                pyd_nd[edge.source],
+                pyd_nd[edge.destination],
+                label=edge.short_reason,
+                tooltip=_edge_tooltip(edge)
+            ))
 
     # and draw
     pydg.write(filepath, format=file_format)

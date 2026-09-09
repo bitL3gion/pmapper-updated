@@ -51,6 +51,12 @@ def get_resource(arn: str):
     return ':'.join(arn.split(':')[5:])
 
 
+def get_name(arn: str):
+    """Returns the final path-segment of the resource part of a string ARN, e.g. the role/user/instance-profile
+    name. Useful for building example AWS CLI commands that reference a specific resource by name."""
+    return get_resource(arn).split('/')[-1]
+
+
 def validate_arn(arn: str) -> bool:
     """Returns true if the provided ARN appears to follow the expected structure of an ARN."""
     arn_arr = arn.split(':')

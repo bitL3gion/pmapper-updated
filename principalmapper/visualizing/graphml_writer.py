@@ -123,6 +123,18 @@ def generate_graphml(nodes_and_color: Dict[Union[Node, str], Optional[str]], edg
     )
     graphml_element.append(data_edge_label_element)
 
+    # add the <key> element for a detailed description (permissions + example commands) with edges
+    data_edge_description_element = ET.Element(
+        'key',
+        {
+            'id': 'd3',
+            'for': 'edge',
+            'attr.name': 'description',
+            'attr.type': 'string'
+        }
+    )
+    graphml_element.append(data_edge_description_element)
+
     # we create our <graph> element which shall have the child <node>/<edge> elements
     graph_element = ET.Element('graph', {'id': 'G', 'edgedefault': 'directed'})
     graphml_element.append(graph_element)
@@ -175,6 +187,9 @@ def generate_graphml(nodes_and_color: Dict[Union[Node, str], Optional[str]], edg
         edge_label_subelement = ET.Element('data', {'key': 'd2'})
         edge_label_subelement.text = edge.short_reason
         edge_element.append(edge_label_subelement)
+        edge_description_subelement = ET.Element('data', {'key': 'd3'})
+        edge_description_subelement.text = edge.detailed_description()
+        edge_element.append(edge_description_subelement)
         graph_element.append(edge_element)
         edge_counter += 1
 

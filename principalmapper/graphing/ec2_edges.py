@@ -129,10 +129,29 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                 mfa_needed = True
 
             if create_instance_res:
+                dest_role_name = arns.get_name(node_destination.arn)
                 if iprofile != '*':
+                    profile_name = arns.get_name(iprofile)
                     reason = 'can use EC2 to run an instance with an existing instance profile to access'
+                    short_reason = 'EC2 (RunInstances, PassRole)'
+                    permissions = ['iam:PassRole', 'ec2:RunInstances']
+                    commands = [
+                        'aws ec2 run-instances --image-id <AMI_ID> --iam-instance-profile Name={} '
+                        '--key-name <KEY_PAIR_NAME>'.format(profile_name),
+                        'On the new instance: curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{}'.format(dest_role_name)
+                    ]
                 else:
                     reason = 'can use EC2 to run an instance with a newly created instance profile to access'
+                    short_reason = 'EC2 (CreateInstanceProfile, AddRoleToInstanceProfile, RunInstances, PassRole)'
+                    permissions = ['iam:CreateInstanceProfile', 'iam:AddRoleToInstanceProfile', 'iam:PassRole',
+                                  'ec2:RunInstances']
+                    commands = [
+                        'aws iam create-instance-profile --instance-profile-name pmapper-poc',
+                        'aws iam add-role-to-instance-profile --instance-profile-name pmapper-poc --role-name {}'.format(dest_role_name),
+                        'aws ec2 run-instances --image-id <AMI_ID> --iam-instance-profile Name=pmapper-poc '
+                        '--key-name <KEY_PAIR_NAME>',
+                        'On the new instance: curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{}'.format(dest_role_name)
+                    ]
                 if mfa_needed:
                     reason = '(MFA required) ' + reason
 
@@ -140,7 +159,9 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     node_source,
                     node_destination,
                     reason,
-                    'EC2'
+                    short_reason,
+                    permissions,
+                    commands
                 )
                 result.append(new_edge)
 
@@ -168,9 +189,28 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                 if iprofile != '*':
                     reason = 'can use EC2 to run an instance and then associate an existing instance profile to ' \
                              'access'
+                    short_reason = 'EC2 (RunInstances, AssociateIamInstanceProfile)'
+                    permissions = ['ec2:RunInstances', 'ec2:AssociateIamInstanceProfile']
+                    commands = [
+                        'aws ec2 run-instances --image-id <AMI_ID> --key-name <KEY_PAIR_NAME>',
+                        'aws ec2 associate-iam-instance-profile --instance-id <NEW_INSTANCE_ID> '
+                        '--iam-instance-profile Name={}'.format(arns.get_name(iprofile)),
+                        'On the new instance: curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{}'.format(arns.get_name(node_destination.arn))
+                    ]
                 else:
                     reason = 'can use EC2 to run an instance and then attach a newly created instance profile to ' \
                              'access'
+                    short_reason = 'EC2 (CreateInstanceProfile, AddRoleToInstanceProfile, RunInstances, AssociateIamInstanceProfile)'
+                    permissions = ['iam:CreateInstanceProfile', 'iam:AddRoleToInstanceProfile', 'ec2:RunInstances',
+                                  'ec2:AssociateIamInstanceProfile']
+                    commands = [
+                        'aws iam create-instance-profile --instance-profile-name pmapper-poc',
+                        'aws iam add-role-to-instance-profile --instance-profile-name pmapper-poc --role-name {}'.format(arns.get_name(node_destination.arn)),
+                        'aws ec2 run-instances --image-id <AMI_ID> --key-name <KEY_PAIR_NAME>',
+                        'aws ec2 associate-iam-instance-profile --instance-id <NEW_INSTANCE_ID> '
+                        '--iam-instance-profile Name=pmapper-poc',
+                        'On the new instance: curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{}'.format(arns.get_name(node_destination.arn))
+                    ]
 
                 if mfa_res or mfa_needed:
                     reason = '(MFA required) ' + reason
@@ -180,7 +220,9 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                         node_source,
                         node_destination,
                         reason,
-                        'EC2'
+                        short_reason,
+                        permissions,
+                        commands
                     )
                     result.append(new_edge)
 

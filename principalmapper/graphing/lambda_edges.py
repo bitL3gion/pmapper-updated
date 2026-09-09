@@ -136,11 +136,19 @@ def generate_edges_locally(nodes: List[Node], function_list: List[dict], scps: O
                                  'then pass and access'
                     else:
                         reason = 'can use Lambda to create a new function with arbitrary code, then pass and access'
+                    dest_role_arn = node_destination.arn
                     new_edge = Edge(
                         node_source,
                         node_destination,
                         reason,
-                        'Lambda'
+                        'Lambda (CreateFunction, PassRole)',
+                        ['iam:PassRole', 'lambda:CreateFunction'],
+                        [
+                            'aws lambda create-function --function-name pmapper-poc --runtime python3.12 '
+                            '--handler lambda_function.lambda_handler --role {} '
+                            '--zip-file fileb://function.zip'.format(dest_role_arn),
+                            'aws lambda invoke --function-name pmapper-poc output.txt'
+                        ]
                     )
                     result.append(new_edge)
                     continue  # TODO: reexamine if it is appropriate to skip the next checks, which can be O(n^2) in some accounts
@@ -174,7 +182,12 @@ def generate_edges_locally(nodes: List[Node], function_list: List[dict], scps: O
                             node_source,
                             node_destination,
                             reason,
-                            'Lambda'
+                            'Lambda (UpdateFunctionCode)',
+                            ['lambda:UpdateFunctionCode'],
+                            [
+                                'aws lambda update-function-code --function-name {} --zip-file fileb://function.zip'.format(func['FunctionArn']),
+                                'aws lambda invoke --function-name {} output.txt'.format(func['FunctionArn'])
+                            ]
                         )
                         result.append(new_edge)
                         break
@@ -200,7 +213,15 @@ def generate_edges_locally(nodes: List[Node], function_list: List[dict], scps: O
                         node_source,
                         node_destination,
                         reason,
-                        'Lambda'
+                        'Lambda (UpdateFunctionCode, UpdateFunctionConfiguration, PassRole)',
+                        ['lambda:UpdateFunctionCode', 'lambda:UpdateFunctionConfiguration', 'iam:PassRole'],
+                        [
+                            'aws lambda update-function-configuration --function-name {} --role {}'.format(
+                                func['FunctionArn'], node_destination.arn
+                            ),
+                            'aws lambda update-function-code --function-name {} --zip-file fileb://function.zip'.format(func['FunctionArn']),
+                            'aws lambda invoke --function-name {} output.txt'.format(func['FunctionArn'])
+                        ]
                     )
                     result.append(new_edge)
                     break

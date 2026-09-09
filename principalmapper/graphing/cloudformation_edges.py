@@ -138,7 +138,16 @@ def generate_edges_locally(nodes: List[Node], stack_list: List[dict], scps: Opti
                     if need_mfa_passrole or need_mfa_create:
                         reason = '(MFA required) ' + reason
 
-                    result.append(Edge(node_source, node_destination, reason, 'Cloudformation'))
+                    result.append(Edge(
+                        node_source, node_destination, reason, 'CloudFormation (CreateStack, PassRole)',
+                        ['iam:PassRole', 'cloudformation:CreateStack'],
+                        [
+                            'aws cloudformation create-stack --stack-name pmapper-poc '
+                            '--template-body file://template.yaml --role-arn {}'.format(node_destination.arn),
+                            '# template.yaml should define resources/outputs that expose the role\'s credentials, '
+                            'e.g. a custom resource Lambda or an SSM parameter'
+                        ]
+                    ))
 
             relevant_stacks = []  # we'll reuse this for *ChangeSet
             for stack in stack_list:
@@ -162,7 +171,13 @@ def generate_edges_locally(nodes: List[Node], stack_list: List[dict], scps: Opti
                     if need_mfa_update:
                         reason = '(MFA required) ' + reason
 
-                    result.append(Edge(node_source, node_destination, reason, 'Cloudformation'))
+                    result.append(Edge(
+                        node_source, node_destination, reason, 'CloudFormation (UpdateStack)',
+                        ['cloudformation:UpdateStack'],
+                        [
+                            'aws cloudformation update-stack --stack-name {} --template-body file://template.yaml'.format(stack['StackId'])
+                        ]
+                    ))
                     break  # let's save ourselves having to dig into every CF stack edge possible
 
             # See if source can call UpdateStack to pass a new role to a stack and use it
@@ -183,8 +198,15 @@ def generate_edges_locally(nodes: List[Node], stack_list: List[dict], scps: Opti
                         if need_mfa_update or need_mfa_passrole:
                             reason = '(MFA required) ' + reason
 
-                        result.append(Edge(node_source, node_destination, reason, 'Cloudformation'))
-                        break  # save ourselves from digging into all CF stack edges possible
+                        result.append(Edge(
+                            node_source, node_destination, reason, 'CloudFormation (UpdateStack, PassRole)',
+                            ['iam:PassRole', 'cloudformation:UpdateStack'],
+                            [
+                                'aws cloudformation update-stack --stack-name {} --template-body file://template.yaml '
+                                '--role-arn {}'.format(stack['StackId'], node_destination.arn)
+                            ]
+                        ))
+                        break  # save ourselves from digging into all CF stack edge possible
 
             # See if source can call CreateChangeSet and ExecuteChangeSet to alter a stack with a given role
             for stack in relevant_stacks:
@@ -213,7 +235,15 @@ def generate_edges_locally(nodes: List[Node], stack_list: List[dict], scps: Opti
                     if need_mfa_make or need_mfa_exe:
                         reason = '(MFA required) ' + reason
 
-                    result.append(Edge(node_source, node_destination, reason, 'Cloudformation'))
-                    break  # save ourselves from digging into all CF stack edges possible
+                    result.append(Edge(
+                        node_source, node_destination, reason, 'CloudFormation (CreateChangeSet, ExecuteChangeSet)',
+                        ['cloudformation:CreateChangeSet', 'cloudformation:ExecuteChangeSet'],
+                        [
+                            'aws cloudformation create-change-set --stack-name {} --template-body file://template.yaml '
+                            '--change-set-name pmapper-poc --role-arn {}'.format(stack['StackId'], node_destination.arn),
+                            'aws cloudformation execute-change-set --change-set-name pmapper-poc --stack-name {}'.format(stack['StackId'])
+                        ]
+                    ))
+                    break  # save ourselves from digging into all CF stack edge possible
 
     return result

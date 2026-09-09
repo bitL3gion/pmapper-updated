@@ -111,7 +111,9 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     node_source,
                     node_destination,
                     reason,
-                    'AssumeRole'
+                    'STS (AssumeRole)',
+                    ['sts:AssumeRole'],
+                    ['aws sts assume-role --role-arn {} --role-session-name pmapper-poc'.format(node_destination.arn)]
                 )
                 result.append(new_edge)
             elif not (policy_denies_mfa and policy_denies) and sim_result == ResourcePolicyEvalResult.NODE_MATCH:
@@ -120,7 +122,9 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     node_source,
                     node_destination,
                     'can access via sts:AssumeRole',
-                    'AssumeRole'
+                    'STS (AssumeRole)',
+                    ['sts:AssumeRole'],
+                    ['aws sts assume-role --role-arn {} --role-session-name pmapper-poc'.format(node_destination.arn)]
                 )
                 result.append(new_edge)
 

@@ -37,7 +37,7 @@ setup(
     include_package_data=True,
     packages=find_packages(exclude=("tests", )),
     package_data={},
-    python_requires='>=3.5, <4',  # assume Python 4 will break
+    python_requires='>=3.6, <4',  # assume Python 4 will break
     install_requires=['botocore', 'packaging', 'python-dateutil', 'pydot'],
     entry_points={
         'console_scripts': [
@@ -52,11 +52,14 @@ setup(
         'License :: OSI Approved :: GNU Affero General Public License v3',
         'Natural Language :: English',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
         'Topic :: Security'
     ],
     keywords=[
