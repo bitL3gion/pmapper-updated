@@ -860,7 +860,7 @@ def update_admin_status(nodes: List[Node], scps: Optional[List[List[dict]]] = No
                 continue  # if we add more checks later, this optimizes them out when appropriate
 
 
-def get_organizations_data(session: botocore.session.Session) -> OrganizationTree:
+def get_organizations_data(session: botocore.session.Session, max_workers: int = DEFAULT_MAX_WORKERS) -> OrganizationTree:
     """Given a botocore Session object, generate an OrganizationTree object. This throws a RuntimeError if the session
     is for an Account that is not able to gather Organizations data, along with the reason why.
 
@@ -898,7 +898,6 @@ def get_organizations_data(session: botocore.session.Session) -> OrganizationTre
     )
 
     scp_list = []
-    root_ous = []
     account_ids = []
 
     # get root IDs to start
@@ -956,7 +955,6 @@ def get_organizations_data(session: botocore.session.Session) -> OrganizationTre
         ou_scps = _get_scps_for_target(parent_id)
 
         # Get accounts under the OU
-        org_account_objs = []   # type: List[OrganizationAccount]
         list_accounts_paginator = orgsclient.get_paginator('list_accounts_for_parent')
         ou_child_account_list = []
         for lap_page in list_accounts_paginator.paginate(ParentId=parent_id):
@@ -965,10 +963,13 @@ def get_organizations_data(session: botocore.session.Session) -> OrganizationTre
         logger.debug('Accounts: {}'.format(ou_child_account_list))
 
         account_ids.extend(ou_child_account_list)
-        for ou_child_account_id in ou_child_account_list:
+
+        def _compose_account(ou_child_account_id: str) -> OrganizationAccount:
             child_account_tags = _get_tags_for_target(ou_child_account_id)
             child_account_scps = _get_scps_for_target(ou_child_account_id)
-            org_account_objs.append(OrganizationAccount(ou_child_account_id, child_account_scps, child_account_tags))
+            return OrganizationAccount(ou_child_account_id, child_account_scps, child_account_tags)
+
+        org_account_objs = thread_map(_compose_account, ou_child_account_list, max_workers=max_workers)
 
         # get child OUs (pairs of Ids and Names)
         child_ou_ids = []
@@ -977,16 +978,15 @@ def get_organizations_data(session: botocore.session.Session) -> OrganizationTre
             for child in lcp_page['Children']:
                 child_ou_ids.append(child['Id'])
 
-        child_ous = []  # type: List[OrganizationNode]
-        for child_ou_id in child_ou_ids:
+        def _compose_child_ou(child_ou_id: str) -> OrganizationNode:
             desc_ou_resp = orgsclient.describe_organizational_unit(OrganizationalUnitId=child_ou_id)
-            child_ous.append(_compose_ou(child_ou_id, desc_ou_resp['OrganizationalUnit']['Name']))
+            return _compose_ou(child_ou_id, desc_ou_resp['OrganizationalUnit']['Name'])
+
+        child_ous = thread_map(_compose_child_ou, child_ou_ids, max_workers=max_workers)
 
         return OrganizationNode(parent_id, parent_name, org_account_objs, child_ous, ou_scps, ou_tags)
 
-    for root_id_and_name in root_ids_and_names:
-        root_ou_id, root_ou_name = root_id_and_name
-        root_ous.append(_compose_ou(root_ou_id, root_ou_name))
+    root_ous = thread_map(lambda root: _compose_ou(root[0], root[1]), root_ids_and_names, max_workers=max_workers)
 
     # apply root OUs to result
     result.root_ous = root_ous

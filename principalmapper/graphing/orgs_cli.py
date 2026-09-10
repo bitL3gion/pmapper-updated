@@ -29,6 +29,7 @@ from principalmapper.graphing.cross_account_edges import get_edges_between_graph
 from principalmapper.graphing.gathering import get_organizations_data
 from principalmapper.querying.query_orgs import produce_scp_list
 from principalmapper.util import botocore_tools
+from principalmapper.util.concurrency import DEFAULT_MAX_WORKERS
 from principalmapper.util.storage import get_storage_root
 
 
@@ -51,6 +52,14 @@ def provide_arguments(parser: ArgumentParser):
         'create',
         description='Creates and stores a OrganizationTree object for a given AWS Organization',
         help='Creates and stores a OrganizationTree object for a given AWS Organization'
+    )
+    create_parser.add_argument(
+        '--max-threads',
+        type=int,
+        default=DEFAULT_MAX_WORKERS,
+        help='The maximum number of concurrent AWS API calls to run while gathering data (default: {}). '
+             'Set to 1 for fully-sequential behavior.'.format(DEFAULT_MAX_WORKERS),
+        metavar='N'
     )
 
     list_parser = orgs_subparser.add_parser(
@@ -100,7 +109,7 @@ def process_arguments(parsed_args: Namespace):
 
         # get the botocore session and go to work creating the OrganizationTree obj
         session = botocore_tools.get_session(parsed_args.profile)
-        org_tree = get_organizations_data(session)
+        org_tree = get_organizations_data(session, parsed_args.max_threads)
         logger.info('Generated initial organization data for {}'.format(org_tree.org_id))
 
         # create the account -> OU path map and apply to all accounts (same as orgs update operation)
