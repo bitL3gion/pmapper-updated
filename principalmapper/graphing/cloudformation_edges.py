@@ -20,13 +20,14 @@ import logging
 import os
 from typing import List, Optional
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from principalmapper.common import Edge, Node
 from principalmapper.graphing.edge_checker import EdgeChecker
 from principalmapper.querying import query_interface
 from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult
 from principalmapper.util import arns, botocore_tools
+from principalmapper.util.concurrency import thread_map
 
 
 logger = logging.getLogger(__name__)
@@ -52,23 +53,28 @@ class CloudFormationEdgeChecker(EdgeChecker):
         if self.session is not None:
             cf_regions = botocore_tools.get_regions_to_search(self.session, 'cloudformation', region_allow_list, region_deny_list)
             for region in cf_regions:
-                cloudformation_clients.append(self.session.create_client('cloudformation', region_name=region, **cfargs))
+                cloudformation_clients.append(self.session.create_client('cloudformation', region_name=region, **botocore_tools.with_fast_fail_config(cfargs)))
 
         # grab existing cloudformation stacks
-        stack_list = []
-        for cf_client in cloudformation_clients:
+        def _get_stacks_for_region(cf_client) -> List[dict]:
             logger.debug('Looking at region {}'.format(cf_client.meta.region_name))
+            region_stacks = []
             try:
                 paginator = cf_client.get_paginator('describe_stacks')
                 for page in paginator.paginate():
                     for stack in page['Stacks']:
                         if stack['StackStatus'] not in ['CREATE_FAILED', 'DELETE_COMPLETE', 'DELETE_FAILED',
                                                         'DELETE_IN_PROGRESS']:  # ignore unusable stacks
-                            stack_list.append(stack)
-            except ClientError as ex:
+                            region_stacks.append(stack)
+            except (ClientError, BotoCoreError) as ex:
                 logger.warning('Unable to search region {} for stacks. The region may be disabled, or the error may '
                                'be caused by an authorization issue. Continuing.'.format(cf_client.meta.region_name))
                 logger.debug('Exception details: {}'.format(ex))
+            return region_stacks
+
+        stack_list = []
+        for region_result in thread_map(_get_stacks_for_region, cloudformation_clients):
+            stack_list.extend(region_result)
 
         logger.info('Generating Edges based on data from CloudFormation.')
         result = generate_edges_locally(nodes, stack_list, scps)

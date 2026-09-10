@@ -19,9 +19,41 @@ import logging
 from typing import List, Optional
 
 import botocore.session
+from botocore.config import Config
 
 
 logger = logging.getLogger(__name__)
+
+# A handful of AWS regions are disabled-but-still-DNS-resolvable in a way that makes API calls hang until
+# botocore's default connect/read timeouts (60s each) elapse, then retry a couple more times before finally
+# raising ReadTimeoutError/ConnectTimeoutError - multiplied across every region-scanning service PMapper calls,
+# this alone can add many minutes to a single `pmapper graph create` run. The actual data these per-region
+# "does this service have anything here" scans return is small, so a much shorter timeout is safe: a live,
+# enabled region will comfortably respond within this window, while a disabled/unreachable one now fails fast
+# instead of hanging.
+FAST_FAIL_CONNECT_TIMEOUT = 10
+FAST_FAIL_READ_TIMEOUT = 15
+FAST_FAIL_MAX_ATTEMPTS = 2
+
+
+def with_fast_fail_config(client_args: Optional[dict] = None) -> dict:
+    """Given a dict of kwargs intended for `session.create_client(...)`, returns a new dict with a short
+    connect/read timeout and reduced retry count applied via the `config` kwarg - unless the caller already
+    supplied their own `config`, in which case it's left untouched (an explicit caller-provided config wins).
+
+    Intended for the many per-region "is there anything here" list/describe calls PMapper makes while
+    gathering data (e.g. one call per region per service, across ~30 regions), where a disabled or otherwise
+    unreachable region should fail in seconds, not minutes. Not intended for the primary IAM/STS calls (like
+    `get_account_authorization_details`), which can legitimately take longer for large accounts.
+    """
+    result = dict(client_args) if client_args else {}
+    if 'config' not in result:
+        result['config'] = Config(
+            connect_timeout=FAST_FAIL_CONNECT_TIMEOUT,
+            read_timeout=FAST_FAIL_READ_TIMEOUT,
+            retries={'max_attempts': FAST_FAIL_MAX_ATTEMPTS, 'mode': 'standard'}
+        )
+    return result
 
 
 def get_session(profile_arg: Optional[str], stsargs: Optional[dict] = None) -> botocore.session.Session:

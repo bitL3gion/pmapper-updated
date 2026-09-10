@@ -19,13 +19,14 @@
 import logging
 from typing import Dict, List, Optional
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from principalmapper.common import Edge, Node
 from principalmapper.graphing.edge_checker import EdgeChecker
 from principalmapper.querying import query_interface
 from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult
 from principalmapper.util import arns, botocore_tools
+from principalmapper.util.concurrency import thread_map
 
 logger = logging.getLogger(__name__)
 
@@ -50,26 +51,30 @@ class AutoScalingEdgeChecker(EdgeChecker):
         if self.session is not None:
             as_regions = botocore_tools.get_regions_to_search(self.session, 'autoscaling', region_allow_list, region_deny_list)
             for region in as_regions:
-                autoscaling_clients.append(self.session.create_client('autoscaling', region_name=region, **asargs))
+                autoscaling_clients.append(self.session.create_client('autoscaling', region_name=region, **botocore_tools.with_fast_fail_config(asargs)))
 
-        launch_configs = []
-        for as_client in autoscaling_clients:
+        def _get_launch_configs_for_region(as_client) -> List[dict]:
             logger.debug('Looking at region {}'.format(as_client.meta.region_name))
+            region_launch_configs = []
             try:
                 lc_paginator = as_client.get_paginator('describe_launch_configurations')
                 for page in lc_paginator.paginate():
                     if 'LaunchConfigurations' in page:
                         for launch_config in page['LaunchConfigurations']:
                             if 'IamInstanceProfile' in launch_config and launch_config['IamInstanceProfile']:
-                                launch_configs.append({
+                                region_launch_configs.append({
                                     'lc_arn': launch_config['LaunchConfigurationARN'],
                                     'lc_iip': launch_config['IamInstanceProfile']
                                 })
-
-            except ClientError as ex:
+            except (ClientError, BotoCoreError) as ex:
                 logger.warning('Unable to search region {} for launch configs. The region may be disabled, or the error may '
                                'be caused by an authorization issue. Continuing.'.format(as_client.meta.region_name))
                 logger.debug('Exception details: {}'.format(ex))
+            return region_launch_configs
+
+        launch_configs = []
+        for region_result in thread_map(_get_launch_configs_for_region, autoscaling_clients):
+            launch_configs.extend(region_result)
 
         result = generate_edges_locally(nodes, scps, launch_configs)
 

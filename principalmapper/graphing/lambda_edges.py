@@ -20,13 +20,14 @@ import logging
 import os
 from typing import List, Optional
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from principalmapper.common import Edge, Node
 from principalmapper.graphing.edge_checker import EdgeChecker
 from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult
 from principalmapper.querying import query_interface
 from principalmapper.util import arns, botocore_tools
+from principalmapper.util.concurrency import thread_map
 
 
 logger = logging.getLogger(__name__)
@@ -51,20 +52,25 @@ class LambdaEdgeChecker(EdgeChecker):
         if self.session is not None:
             lambda_regions = botocore_tools.get_regions_to_search(self.session, 'lambda', region_allow_list, region_deny_list)
             for region in lambda_regions:
-                lambda_clients.append(self.session.create_client('lambda', region_name=region, **lambdaargs))
+                lambda_clients.append(self.session.create_client('lambda', region_name=region, **botocore_tools.with_fast_fail_config(lambdaargs)))
 
         # grab existing lambda functions
-        function_list = []
-        for lambda_client in lambda_clients:
+        def _get_functions_for_region(lambda_client) -> List[dict]:
+            region_functions = []
             try:
                 paginator = lambda_client.get_paginator('list_functions')
                 for page in paginator.paginate(PaginationConfig={'PageSize': 25}):
                     for func in page['Functions']:
-                        function_list.append(func)
-            except ClientError as ex:
-                logger.warning('Unable to search region {} for stacks. The region may be disabled, or the error may '
+                        region_functions.append(func)
+            except (ClientError, BotoCoreError) as ex:
+                logger.warning('Unable to search region {} for functions. The region may be disabled, or the error may '
                                'be caused by an authorization issue. Continuing.'.format(lambda_client.meta.region_name))
                 logger.debug('Exception details: {}'.format(ex))
+            return region_functions
+
+        function_list = []
+        for region_result in thread_map(_get_functions_for_region, lambda_clients):
+            function_list.extend(region_result)
 
         logger.info('Generating Edges based on Lambda data.')
         logger.debug('Identified {} Lambda functions for processing'.format(len(function_list)))

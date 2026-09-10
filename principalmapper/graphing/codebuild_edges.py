@@ -19,13 +19,14 @@
 import logging
 from typing import Dict, List, Optional
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from principalmapper.common import Edge, Node
 from principalmapper.graphing.edge_checker import EdgeChecker
 from principalmapper.querying import query_interface
 from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult
 from principalmapper.util import arns, botocore_tools
+from principalmapper.util.concurrency import thread_map
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +52,14 @@ class CodeBuildEdgeChecker(EdgeChecker):
         if self.session is not None:
             cf_regions = botocore_tools.get_regions_to_search(self.session, 'codebuild', region_allow_list, region_deny_list)
             for region in cf_regions:
-                codebuild_clients.append(self.session.create_client('codebuild', region_name=region, **cbargs))
+                codebuild_clients.append(self.session.create_client('codebuild', region_name=region, **botocore_tools.with_fast_fail_config(cbargs)))
 
         codebuild_projects = []
-        for cb_client in codebuild_clients:
+
+        def _get_projects_for_region(cb_client) -> List[dict]:
             logger.debug('Looking at region {}'.format(cb_client.meta.region_name))
             region_project_list_list = []
+            region_projects = []
             try:
                 # list the projects first, 50 at a time
                 paginator = cb_client.get_paginator('list_projects')
@@ -69,16 +72,20 @@ class CodeBuildEdgeChecker(EdgeChecker):
                     if 'projects' in batch_project_data:
                         for project_data in batch_project_data['projects']:
                             if 'serviceRole' in project_data:
-                                codebuild_projects.append({
+                                region_projects.append({
                                     'project_arn': project_data['arn'],
                                     'project_role': project_data['serviceRole'],
                                     'project_tags': project_data['tags']
                                 })
 
-            except ClientError as ex:
+            except (ClientError, BotoCoreError) as ex:
                 logger.warning('Unable to search region {} for projects. The region may be disabled, or the error may '
                                'be caused by an authorization issue. Continuing.'.format(cb_client.meta.region_name))
                 logger.debug('Exception details: {}'.format(ex))
+            return region_projects
+
+        for region_result in thread_map(_get_projects_for_region, codebuild_clients):
+            codebuild_projects.extend(region_result)
 
         result = generate_edges_locally(nodes, scps, codebuild_projects)
 

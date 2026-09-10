@@ -27,7 +27,7 @@ from principalmapper.common import Node, Group, Policy, Graph, OrganizationTree,
 from principalmapper.graphing import edge_identification
 from principalmapper.querying import query_interface
 from principalmapper.util import arns
-from principalmapper.util.botocore_tools import get_regions_to_search
+from principalmapper.util.botocore_tools import get_regions_to_search, with_fast_fail_config
 from principalmapper.util.concurrency import DEFAULT_MAX_WORKERS, thread_map
 from typing import List, Optional, Tuple
 
@@ -86,22 +86,17 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
     # Determine which nodes are admins and update node objects
     update_admin_status(nodes_result, scps)
 
-    # Generate edges, generate Edge objects
-    edges_result = edge_identification.obtain_edges(
-        session,
-        service_list,
-        nodes_result,
-        region_allow_list,
-        region_deny_list,
-        scps,
-        client_args_map,
-        max_workers
-    )
-
-    # Pull S3, SNS, SQS, KMS, and Secrets Manager resource policies. These are independent of each other, so
-    # run them concurrently, and let each fail on its own (e.g. due to missing permissions for that one
-    # service) without preventing the others from completing.
-    resource_policy_gatherers = [
+    # Generate Edge objects, and pull S3/SNS/SQS/KMS/Secrets Manager resource policies. These are all
+    # independent of each other (edges don't depend on resource policies or vice versa), so run them all
+    # concurrently rather than as separate sequential phases - each one already fans out across regions on
+    # its own, but without this they'd still be paying for e.g. a disabled region's connection timeout twice:
+    # once during edge identification, once again during resource-policy gathering. Each is allowed to fail
+    # independently (e.g. due to missing permissions for that one service) without affecting the others.
+    gathering_tasks = [
+        ('edges', lambda: edge_identification.obtain_edges(
+            session, service_list, nodes_result, region_allow_list, region_deny_list, scps, client_args_map,
+            max_workers
+        )),
         ('S3', lambda: get_s3_bucket_policies(session, client_args_map, max_workers)),
         ('SNS', lambda: get_sns_topic_policies(session, region_allow_list, region_deny_list, client_args_map, max_workers)),
         ('SQS', lambda: get_sqs_queue_policies(session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map, max_workers)),
@@ -109,16 +104,20 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
         ('Secrets Manager', lambda: get_secrets_manager_policies(session, region_allow_list, region_deny_list, client_args_map, max_workers)),
     ]
 
-    def _gather_resource_policies(entry: Tuple[str, callable]) -> List[Policy]:
-        service_name, gatherer = entry
+    def _run_gathering_task(entry: Tuple[str, callable]) -> Tuple[str, list]:
+        task_name, gatherer = entry
         try:
-            return gatherer()
+            return task_name, gatherer()
         except Exception as ex:
-            logger.info('Unable to gather resource policies for {}, skipping. Exception: {}'.format(service_name, ex))
-            return []
+            logger.info('Unable to complete gathering task "{}", skipping. Exception: {}'.format(task_name, ex))
+            return task_name, []
 
-    for policy_list in thread_map(_gather_resource_policies, resource_policy_gatherers, max_workers=len(resource_policy_gatherers)):
-        policies_result.extend(policy_list)
+    edges_result = []
+    for task_name, task_result in thread_map(_run_gathering_task, gathering_tasks, max_workers=len(gathering_tasks)):
+        if task_name == 'edges':
+            edges_result = task_result
+        else:
+            policies_result.extend(task_result)
 
     return Graph(nodes_result, edges_result, policies_result, groups_result, metadata)
 
@@ -316,7 +315,7 @@ def get_s3_bucket_policies(session: botocore.session.Session, client_args_map: O
             bucket_policy = json.loads(s3client.get_bucket_policy(Bucket=bucket)['Policy'])
             logger.info('Caching policy for {}'.format(bucket_arn))
             return Policy(bucket_arn, bucket, bucket_policy)
-        except botocore.exceptions.ClientError as ex:
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as ex:
             if 'NoSuchBucketPolicy' in str(ex):
                 logger.info('Bucket {} does not have a bucket policy, adding a "stub" policy instead.'.format(
                     bucket
@@ -339,16 +338,14 @@ def get_kms_key_policies(session: botocore.session.Session, region_allow_list: O
     The region allow/deny lists are mutually-exclusive (i.e. at least one of which has the value None) lists of
     allowed/denied regions to pull data from.
     """
-    result = []
-
     kmsargs = client_args_map.get('kms', {})
 
-    # Iterate through all regions of KMS where possible
-    for kms_region in get_regions_to_search(session, 'kms', region_allow_list, region_deny_list):
+    def _get_key_policies_for_region(kms_region: str) -> List[Policy]:
+        region_result = []
         try:
             # Grab the keys
             cmks = []
-            kmsclient = session.create_client('kms', region_name=kms_region, **kmsargs)
+            kmsclient = session.create_client('kms', region_name=kms_region, **with_fast_fail_config(kmsargs))
             kms_paginator = kmsclient.get_paginator('list_keys')
             for page in kms_paginator.paginate():
                 cmks.extend([x['KeyArn'] for x in page['Keys']])
@@ -363,11 +360,18 @@ def get_kms_key_policies(session: botocore.session.Session, region_allow_list: O
                     json.loads(policy_str)
                 )
 
-            result.extend(thread_map(_fetch_key_policy, cmks, max_workers=max_workers))
-        except botocore.exceptions.ClientError as ex:
+            region_result.extend(thread_map(_fetch_key_policy, cmks, max_workers=max_workers))
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as ex:
             logger.info('Unable to search KMS in region {} for key policies. The region may be disabled, or the current principal may not be authorized to access the service. Continuing.'.format(kms_region))
             logger.debug('Exception was: {}'.format(ex))
-            continue
+        return region_result
+
+    result = []
+    # Iterate through all regions of KMS where possible, concurrently: disabled/opt-in regions can otherwise
+    # each cost a full network-timeout before failing, which adds up fast across ~30 regions sequentially.
+    kms_regions = get_regions_to_search(session, 'kms', region_allow_list, region_deny_list)
+    for region_result in thread_map(_get_key_policies_for_region, kms_regions, max_workers=max_workers):
+        result.extend(region_result)
 
     return result
 
@@ -381,16 +385,14 @@ def get_sns_topic_policies(session: botocore.session.Session, region_allow_list:
     The region allow/deny lists are mutually-exclusive (i.e. at least one of which has the value None) lists of
     allowed/denied regions to pull data from.
     """
-    result = []
-
     snsargs = client_args_map.get('sns', {})
 
-    # Iterate through all regions of SNS where possible
-    for sns_region in get_regions_to_search(session, 'sns', region_allow_list, region_deny_list):
+    def _get_topic_policies_for_region(sns_region: str) -> List[Policy]:
+        region_result = []
         try:
             # Grab the topics
             topics = []
-            snsclient = session.create_client('sns', region_name=sns_region, **snsargs)
+            snsclient = session.create_client('sns', region_name=sns_region, **with_fast_fail_config(snsargs))
             sns_paginator = snsclient.get_paginator('list_topics')
             for page in sns_paginator.paginate():
                 topics.extend([x['TopicArn'] for x in page['Topics']])
@@ -405,11 +407,17 @@ def get_sns_topic_policies(session: botocore.session.Session, region_allow_list:
                     json.loads(policy_str)
                 )
 
-            result.extend(thread_map(_fetch_topic_policy, topics, max_workers=max_workers))
-        except botocore.exceptions.ClientError as ex:
+            region_result.extend(thread_map(_fetch_topic_policy, topics, max_workers=max_workers))
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as ex:
             logger.info('Unable to search SNS in region {} for topic policies. The region may be disabled, or the current principal may not be authorized to access the service. Continuing.'.format(sns_region))
             logger.debug('Exception was: {}'.format(ex))
-            continue
+        return region_result
+
+    result = []
+    # Iterate through all regions of SNS where possible, concurrently (see comment in get_kms_key_policies).
+    sns_regions = get_regions_to_search(session, 'sns', region_allow_list, region_deny_list)
+    for region_result in thread_map(_get_topic_policies_for_region, sns_regions, max_workers=max_workers):
+        result.extend(region_result)
 
     return result
 
@@ -424,21 +432,19 @@ def get_sqs_queue_policies(session: botocore.session.Session, account_id: str,
     The region allow/deny lists are mutually-exclusive (i.e. at least one of which has the value None) lists of
     allowed/denied regions to pull data from.
     """
-    result = []
-
     sqsargs = client_args_map.get('sqs', {})
 
-    # Iterate through all regions of SQS where possible
-    for sqs_region in get_regions_to_search(session, 'sqs', region_allow_list, region_deny_list):
+    def _get_queue_policies_for_region(sqs_region: str) -> List[Policy]:
+        region_result = []
         try:
             # Grab the queue names
             queue_urls = []
-            sqsclient = session.create_client('sqs', region_name=sqs_region, **sqsargs)
+            sqsclient = session.create_client('sqs', region_name=sqs_region, **with_fast_fail_config(sqsargs))
             response = sqsclient.list_queues()
             if 'QueueUrls' in response:
                 queue_urls.extend(response['QueueUrls'])
             else:
-                continue
+                return region_result
 
             # Grab the queue policies
             def _fetch_queue_policy(queue_url: str) -> Policy:
@@ -453,10 +459,17 @@ def get_sqs_queue_policies(session: botocore.session.Session, account_id: str,
                     logger.info('Queue {} does not have a queue policy, adding a "stub" policy instead.'.format(queue_name))
                     return Policy(queue_arn, queue_name, {"Statement": [], "Version": "2012-10-17"})
 
-            result.extend(thread_map(_fetch_queue_policy, queue_urls, max_workers=max_workers))
-        except botocore.exceptions.ClientError as ex:
+            region_result.extend(thread_map(_fetch_queue_policy, queue_urls, max_workers=max_workers))
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as ex:
             logger.info('Unable to search SQS in region {} for queues. The region may be disabled, or the current principal may not be authorized to access the service. Continuing.'.format(sqs_region))
             logger.debug('Exception was: {}'.format(ex))
+        return region_result
+
+    result = []
+    # Iterate through all regions of SQS where possible, concurrently (see comment in get_kms_key_policies).
+    sqs_regions = get_regions_to_search(session, 'sqs', region_allow_list, region_deny_list)
+    for region_result in thread_map(_get_queue_policies_for_region, sqs_regions, max_workers=max_workers):
+        result.extend(region_result)
 
     return result
 
@@ -470,16 +483,14 @@ def get_secrets_manager_policies(session: botocore.session.Session, region_allow
     The region allow/deny lists are mutually-exclusive (i.e. at least one of which has the value None) lists of
     allowed/denied regions to pull data from.
     """
-    result = []
-
     smargs = client_args_map.get('secretsmanager', {})
 
-    # Iterate through all regions of Secrets Manager where possible
-    for sm_region in get_regions_to_search(session, 'secretsmanager', region_allow_list, region_deny_list):
+    def _get_secret_policies_for_region(sm_region: str) -> List[Policy]:
+        region_result = []
         try:
             # Grab the ARNs of the secrets in this region
             secret_arns = []
-            smclient = session.create_client('secretsmanager', region_name=sm_region, **smargs)
+            smclient = session.create_client('secretsmanager', region_name=sm_region, **with_fast_fail_config(smargs))
             list_secrets_paginator = smclient.get_paginator('list_secrets')
             for page in list_secrets_paginator.paginate():
                 if 'SecretList' in page:
@@ -501,12 +512,20 @@ def get_secrets_manager_policies(session: botocore.session.Session, region_allow
                     logger.info('Secret {} does not have a resource policy, inserting a "stub" policy instead'.format(secret_arn))
                     return Policy(secret_arn, sm_response['Name'], {"Statement": [], "Version": "2012-10-17"})
 
-            result.extend(thread_map(_fetch_secret_policy, secret_arns, max_workers=max_workers))
-        except botocore.exceptions.ClientError as ex:
+            region_result.extend(thread_map(_fetch_secret_policy, secret_arns, max_workers=max_workers))
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as ex:
             logger.info('Unable to search Secrets Manager in region {} for secrets. The region may be disabled, or '
                         'the current principal may not be authorized to access the service. '
                         'Continuing.'.format(sm_region))
             logger.debug('Exception was: {}'.format(ex))
+        return region_result
+
+    result = []
+    # Iterate through all regions of Secrets Manager where possible, concurrently (see comment in
+    # get_kms_key_policies).
+    sm_regions = get_regions_to_search(session, 'secretsmanager', region_allow_list, region_deny_list)
+    for region_result in thread_map(_get_secret_policies_for_region, sm_regions, max_workers=max_workers):
+        result.extend(region_result)
 
     return result
 
